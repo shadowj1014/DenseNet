@@ -46,5 +46,153 @@
   - 实际使用各个深度学习框架已经封装了DenseNet的几种主要网络结构（DenseNet121等），使用很方便，不建议自己搭建（尤其对于DenseNet这样很深的网络）。
   - 网络构建对照结构表即可，这是复现论文网络结构的主要依据。默认参数实现的是带bottleneck的DenseNet121，其他结构调整函数的参数即可，参考[代码](https://github.com/titu1994/DenseNet/blob/master/densenet.py)。
 - 代码
+  - ```python
+    from keras.models import Model
+    from keras.layers import BatchNormalization, Conv2D, Activation, Dropout, AveragePooling2D, concatenate, GlobalAveragePooling2D, MaxPooling2D, Dense, Input
+    from keras.regularizers import l2
+    import keras.backend as K
+
+
+    def Conv_Block(input_tensor, filters, bottleneck=False, dropout_rate=None, weight_decay=1e-4):
+        """
+        封装卷积层
+        :param input_tensor: 输入张量
+        :param filters: 卷积核数目
+        :param bottleneck: 是否使用bottleneck
+        :param dropout_rate: dropout比率
+        :param weight_decay: 权重衰减率
+        :return:
+        """
+        concat_axis = 1 if K.image_data_format() == 'channel_first' else -1  # 确定格式
+
+        x = BatchNormalization(axis=concat_axis, epsilon=1.1e-5)(input_tensor)
+        x = Activation('relu')(x)
+
+        if bottleneck:
+            # 使用bottleneck进行降维
+            inter_channel = filters * 4
+            x = Conv2D(inter_channel, (1, 1),
+                      kernel_initializer='he_normal',
+                      padding='same', use_bias=False,
+                      kernel_regularizer=l2(weight_decay))(x)
+            x = BatchNormalization(axis=concat_axis, epsilon=1.1e-5)(x)
+            x = Activation('relu')(x)
+
+        x = Conv2D(filters, (3, 3), kernel_initializer='he_normal', padding='same', use_bias=False)(x)
+
+        if dropout_rate:
+            x = Dropout(dropout_rate)(x)
+        return x
+
+
+    def Transition_Block(input_tensor, filters, compression_rate, weight_decay=1e-4):
+        """
+        封装Translation layer
+        :param input_tensor: 输入张量
+        :param filters: 卷积核数目
+        :param compression_rate: 压缩率
+        :param weight_decay: 权重衰减率
+        :return:
+        """
+        concat_axis = 1 if K.image_data_format() == 'channel_first' else -1  # 确定格式
+
+        x = BatchNormalization(axis=concat_axis, epsilon=1.1e-5)(input_tensor)
+        x = Activation('relu')(x)
+        x = Conv2D(int(filters * compression_rate), (1, 1),
+                  kernel_initializer='he_normal',
+                  padding='same',
+                  use_bias=False,
+                  kernel_regularizer=l2(weight_decay))(x)
+        x = AveragePooling2D((2, 2), strides=(2, 2))(x)
+        return x
+
+
+    def Dense_Block(x, nb_layers, filters, growth_rate, bottleneck=False, dropout_rate=None, weight_decay=1e-4, grow_nb_filters=True, return_concat_list=False):
+        """
+        实现核心的dense block
+        :param x: 张量
+        :param nb_layers: 模型添加的conv_block数目
+        :param filters: 卷积核数目
+        :param growth_rate: growth rate
+        :param bottleneck: 是否加入bottleneck
+        :param dropout_rate: dropout比率
+        :param weight_decay: 权重衰减
+        :param grow_nb_filters: 是否允许核数目增长
+        :param return_concat_list: 是否返回feature map 的list
+        :return:
+        """
+        concat_axis = 1 if K.image_data_format() == 'channels_first' else -1
+        x_list = [x]
+
+        for i in range(nb_layers):
+            cb = Conv_Block(x, growth_rate, bottleneck, dropout_rate, weight_decay)
+            x_list.append(cb)
+            x = concatenate([x, cb], axis=concat_axis)
+
+            if grow_nb_filters:
+                filters += growth_rate
+
+        if return_concat_list:
+            return x, filters, x_list
+        else:
+            return x, filters
+
+
+    def DenseNet(n_classes=1000, input_shape=(224, 224, 3), include_top=True, nb_dense_block=4, growth_rate=32, nb_filter=64,
+                nb_layers_per_block=[6, 12, 24, 16], bottleneck=True, reduction=0.5, dropout_rate=0.0, weight_decay=1e-4,
+                subsample_initial_block=True):
+        concat_axis = 1 if K.image_data_format() == 'channel_first' else -1
+
+        final_nb_layer = nb_layers_per_block[-1]
+        nb_layers = nb_layers_per_block[:-1]
+
+        compression = 1.0 - reduction
+        if subsample_initial_block:
+            initial_kernel = (7, 7)
+            initial_strides = (2, 2)
+        else:
+            initial_kernel = (3, 3)
+            initial_strides = (1, 1)
+        input_tensor = Input(shape=input_shape)
+        x = Conv2D(nb_filter, initial_kernel, kernel_initializer='he_normal', padding='same',
+                  strides=initial_strides, use_bias=False, kernel_regularizer=l2(weight_decay))(input_tensor)
+        if subsample_initial_block:
+            x = BatchNormalization(axis=concat_axis, epsilon=1.1e-5)(x)
+            x = Activation('relu')(x)
+            x = MaxPooling2D((3, 3), strides=(2, 2), padding='same')(x)
+
+        for block_index in range(nb_dense_block - 1):
+            x, nb_filter = Dense_Block(x, nb_layers[block_index], nb_filter, growth_rate, bottleneck=bottleneck,
+                                      dropout_rate=dropout_rate, weight_decay=weight_decay)
+            x = Transition_Block(x, nb_filter, compression_rate=compression, weight_decay=weight_decay)
+            nb_filter = int(nb_filter * compression)
+
+        x, nb_filter = Dense_Block(x, final_nb_layer, nb_filter, growth_rate, bottleneck=bottleneck,
+                                  dropout_rate=dropout_rate, weight_decay=weight_decay)
+
+        x = BatchNormalization(axis=concat_axis, epsilon=1.1e-5)(x)
+        x = Activation('relu')(x)
+        x = GlobalAveragePooling2D()(x)
+
+        if include_top:
+            x = Dense(n_classes, activation='softmax')(x)
+
+        model = Model(input_tensor, x, name='densenet121')
+
+        return model
+    ```
+- 模型训练
+  - 说明
+    - 数据集使用[Caltech101数据集](http://www.vision.caltech.edu/Image_Datasets/Caltech101/)，比较性能，不进行数据增广（注意删除干扰项）。
+    - Batch大小指定为32，使用BN训练技巧，二次封装Conv2D。
+    - 损失函数使用经典分类的交叉熵损失函数，优化函数使用Adam，激活函数使用Relu。（这都是比较流行的选择）
+  - 训练结果
+    - 具体结果见Github根目录notebook文件。
+    - 损失图像
+    - 准确率图像
+  - 总体说明
+    - 可以对比之前的ResNet，显然，同一个数据集上同样的超参数设置，DenseNet的收敛速度快了很多(较快达到饱和准确率)，但是这样的快速收敛的代价就是内存的巨大消耗。
 ## 补充说明
 - DenseNet最伟大之处在于其**核心思想为建立不同层之间的连接关系，充分利用feature**，减轻梯度消失问题。同时配合以bottleneck和transition layer以降维减参。
+- 本项目源码开源于Github，欢迎Star或者Fork。
+- 如有错误，欢迎指正。
