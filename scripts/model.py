@@ -81,7 +81,7 @@ def Dense_Block(x, nb_layers, filters, growth_rate, bottleneck=False, dropout_ra
     x_list = [x]
 
     for i in range(nb_layers):
-        cb = Conv_Block(x, growth_rate, bottleneck, dropout_rate, weight_decay)
+        cb = Conv_Block(x, filters, bottleneck, dropout_rate, weight_decay)
         x_list.append(cb)
         x = concatenate([x, cb], axis=concat_axis)
 
